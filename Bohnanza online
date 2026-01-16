@@ -11,3 +11,179 @@
     "nanoid": "^5.0.0"
   }
 }
+// ================================
+// Bohnanza Online – Production Backend (Ready to Paste)
+// Node.js + Socket.IO + nanoid
+// ================================
+// Instructions:
+// 1. Create folder `bohnanza-online`
+// 2. Create `index.js` and paste this code
+// 3. Create `package.json` with provided content
+// 4. Push to GitHub and deploy to Render
+
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
+import { nanoid } from 'nanoid';
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+const PORT = process.env.PORT || 3000;
+
+// ---------------- GAME DATA ----------------
+const BEANS = {
+  Blue: { count: 20, score: [0,0,1,2,3,4] },
+  Red: { count: 18, score: [0,0,1,2,3] },
+  Green: { count: 16, score: [0,0,1,2,3] },
+  Wax: { count: 14, score: [0,0,1,2,3] },
+  Chili: { count: 12, score: [0,0,1,2] },
+  Coffee: { count: 10, score: [0,0,1,2] },
+  Soy: { count: 8, score: [0,0,1] }
+};
+const MAX_PLAYERS = 7;
+
+function createDeck() {
+  const deck = [];
+  for (const b in BEANS) {
+    for (let i = 0; i < BEANS[b].count; i++) deck.push(b);
+  }
+  return deck.sort(() => Math.random() - 0.5);
+}
+function scoreField(field) {
+  const bean = field[0];
+  const table = BEANS[bean].score;
+  return table[Math.min(field.length, table.length - 1)];
+}
+
+// ---------------- ROOM ENGINE ----------------
+const rooms = {};
+function createRoom() {
+  const code = nanoid(5).toUpperCase();
+  rooms[code] = {
+    code,
+    players: {},
+    order: [],
+    turn: 0,
+    phase: 'lobby',
+    deck: [],
+    discard: [],
+    tradeOffers: []
+  };
+  return rooms[code];
+}
+function nextTurn(room) {
+  room.turn = (room.turn + 1) % room.order.length;
+  room.phase = 'plant1';
+}
+function endGame(room) {
+  room.phase = 'end';
+  room.order.forEach(pid => {
+    const p = room.players[pid];
+    p.fields.forEach(f => p.coins += scoreField(f));
+  });
+}
+function createPlayer(name){
+  return { name, hand:[], fields:[[],[]], coins:0 };
+}
+
+// ---------------- SOCKET EVENTS ----------------
+io.on('connection', socket => {
+
+  socket.on('createRoom', name => {
+    const room = createRoom();
+    socket.join(room.code);
+    room.players[socket.id] = createPlayer(name);
+    room.order.push(socket.id);
+    io.to(room.code).emit('state', room);
+  });
+
+  socket.on('joinRoom', ({ code, name }) => {
+    const room = rooms[code];
+    if (!room || room.order.length >= MAX_PLAYERS) return;
+    socket.join(code);
+    room.players[socket.id] = createPlayer(name);
+    room.order.push(socket.id);
+    io.to(code).emit('state', room);
+  });
+
+  socket.on('startGame', code => {
+    const room = rooms[code];
+    if (!room) return;
+    room.deck = createDeck();
+    room.order.forEach(pid => {
+      room.players[pid].hand = room.deck.splice(0,5);
+    });
+    room.phase = 'plant1';
+    io.to(code).emit('state', room);
+  });
+
+  socket.on('plant', ({ code, index }) => {
+    const room = rooms[code];
+    if (!room) return;
+    const pid = room.order[room.turn];
+    if (socket.id !== pid) return;
+
+    const p = room.players[pid];
+    const bean = p.hand.splice(index,1)[0];
+    let field = p.fields.find(f => f.length === 0 || f[0] === bean);
+    if (!field) {
+      p.coins += scoreField(p.fields[0]);
+      p.fields[0] = [];
+      field = p.fields[0];
+    }
+    field.push(bean);
+
+    room.phase = room.phase === 'plant1' ? 'trade' : 'plant2';
+    io.to(code).emit('state', room);
+  });
+
+  socket.on('createTrade', ({ code, offer, want }) => {
+    const room = rooms[code];
+    if (!room || room.phase !== 'trade') return;
+    room.tradeOffers.push({ id:nanoid(), from:socket.id, offer, want });
+    io.to(code).emit('state', room);
+  });
+
+  socket.on('acceptTrade', ({ code, tradeId }) => {
+    const room = rooms[code];
+    const trade = room.tradeOffers.find(t=>t.id===tradeId);
+    if (!trade) return;
+
+    const from = room.players[trade.from];
+    const to = room.players[socket.id];
+
+    trade.offer.forEach(b => to.hand.push(from.hand.splice(from.hand.indexOf(b),1)[0]));
+    trade.want.forEach(b => from.hand.push(to.hand.splice(to.hand.indexOf(b),1)[0]));
+
+    room.tradeOffers = room.tradeOffers.filter(t=>t.id!==tradeId);
+    io.to(code).emit('state', room);
+  });
+
+  socket.on('endTrade', code => {
+    const room = rooms[code];
+    room.tradeOffers = [];
+    room.phase = 'plant2';
+    io.to(code).emit('state', room);
+  });
+
+  socket.on('endTurn', code => {
+    const room = rooms[code];
+    const pid = room.order[room.turn];
+    const p = room.players[pid];
+    if (room.deck.length) p.hand.push(room.deck.pop());
+    if (!room.deck.length) endGame(room);
+    else nextTurn(room);
+    io.to(code).emit('state', room);
+  });
+
+  socket.on('disconnect', () => {
+    for (const r of Object.values(rooms)) {
+      delete r.players[socket.id];
+      r.order = r.order.filter(id=>id!==socket.id);
+    }
+  });
+});
+
+server.listen(PORT,()=>console.log('Bohnanza backend running on',PORT));
